@@ -1,16 +1,22 @@
 # Builds all drivers under drivers/ as part of pull request validation.
 #
+# On pushes to main, each built driver is published as an asset on the rolling
+# "latest" prerelease GitHub Release (created once, by hand). The parallel build
+# matrix uploads each driver's asset to it, so downstream consumers always have
+# one stable, current source.
+#
 # SPDX-License-Identifier: MIT
 #
 
 name: Build Drivers
 
 on:
-  pull_request:
-    branches: [ main ]
+  pull_request: &driver-filters
+    branches: [main]
     paths:
-      - 'drivers/**'
-      - '.github/workflows/build_*.yml'
+      - "drivers/**"
+      - ".github/workflows/build_*.yml"
+  push: *driver-filters
   workflow_dispatch:
 
 concurrency:
@@ -54,6 +60,8 @@ jobs:
     name: Build ${{ matrix.driver.name }} (${{ matrix.platform }})
     needs: discover-drivers
     runs-on: windows-2022
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -82,14 +90,46 @@ jobs:
           Write-Host "Building $project"
           msbuild $project /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WarningLevel=4
 
-      - name: Upload Driver Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: driver-${{ matrix.driver.name }}-${{ matrix.platform }}-Release
-          path: |
-            ${{ matrix.driver.directory }}/${{ matrix.platform }}/Release/**/*.sys
-            ${{ matrix.driver.directory }}/${{ matrix.platform }}/Release/**/*.inf
-            ${{ matrix.driver.directory }}/${{ matrix.platform }}/Release/**/*.cat
-          retention-days: 7
-          if-no-files-found: error
+      # Release assets are raw files (unlike upload-artifact, which zips
+      # automatically), so we bundle each driver into a zip and upload it to the
+      # pre-created release. Uploading only the asset (gh release upload) leaves
+      # the release metadata untouched, so parallel jobs never clobber each
+      # other's flags. --clobber replaces this driver's asset from a prior run.
+      - name: Package and upload driver
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseDir = '${{ matrix.driver.directory }}/${{ matrix.platform }}/Release'
+          $files = Get-ChildItem -Path $releaseDir -Recurse -File -Include *.sys, *.inf, *.cat
+          if (-not $files) {
+            throw "No driver output (.sys/.inf/.cat) found under '$releaseDir'."
+          }
+          $zip = Join-Path $env:RUNNER_TEMP 'driver-${{ matrix.driver.name }}-${{ matrix.platform }}-Release.zip'
+          Compress-Archive -Path $files.FullName -DestinationPath $zip -Force
+          gh release upload latest $zip --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to upload $zip to the latest release."
+          }
+
+  # Move the "latest" tag to this commit so GitHub's auto-generated source-code
+  # archives on the release track main instead of freezing at the commit where
+  # the tag was first created. Runs once (not per matrix leg) and only after all
+  # builds succeed, so the tag never jumps ahead of the uploaded drivers.
+  update-tag:
+    name: Move "latest" Tag
+    needs: build-drivers
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Point "latest" at this commit
+        shell: bash
+        run: |
+          git tag -f latest
+          git push origin latest --force
